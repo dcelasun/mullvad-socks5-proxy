@@ -6,7 +6,7 @@ to selectively enable Mullvad for some websites.
 
 ## Installation
 
-On Arch Linux, simply install the AUR package:
+On Arch Linux, simply install the [AUR package](https://aur.archlinux.org/packages/mullvad-socks5-proxy):
 ```sh
 $ yay -S mullvad-socks5-proxy
 ```
