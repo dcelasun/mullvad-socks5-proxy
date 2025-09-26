@@ -352,11 +352,11 @@ EOF
     fi
 
     echo "Configuring host veth interface..."
-    ip addr add "192.168.100.1/24" dev "$VETH_HOST"
+    ip addr add "192.168.200.1/24" dev "$VETH_HOST"
     ip link set "$VETH_HOST" up
 
     echo "Configuring namespace veth interface..."
-    ip netns exec "$NAMESPACE" ip addr add "192.168.100.2/24" dev "$VETH_NS"
+    ip netns exec "$NAMESPACE" ip addr add "192.168.200.2/24" dev "$VETH_NS"
     if [ $? -ne 0 ]; then
         echo "Error: Failed to configure namespace veth interface"
         cleanup_existing
@@ -372,7 +372,7 @@ EOF
 
     # Forward SOCKS5 traffic from host to namespace
     echo "Setting up port forwarding..."
-    socat TCP-LISTEN:$EXTERNAL_SOCKS5_PORT,fork,bind=127.0.0.1 TCP:192.168.100.2:$INTERNAL_SOCKS5_PORT &
+    socat TCP-LISTEN:$EXTERNAL_SOCKS5_PORT,fork,bind=127.0.0.1 TCP:192.168.200.2:$INTERNAL_SOCKS5_PORT &
     SOCAT_PID=$!
     echo $SOCAT_PID > "/tmp/mullvad-socat-$SERVER.pid"
 
