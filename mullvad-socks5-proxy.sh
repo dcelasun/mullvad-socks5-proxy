@@ -207,6 +207,13 @@ EOF
     mkdir -p "/etc/netns/$NAMESPACE"
     echo "nameserver $DNS_SERVER" | tee "/etc/netns/$NAMESPACE/resolv.conf" > /dev/null
 
+    # Force glibc in the namespace to use the classic 'dns' resolver. Without
+    # this, nss-resolve routes getaddrinfo() to the host's systemd-resolved via
+    # /run/systemd/resolve/io.systemd.Resolve -- a UNIX socket, which is NOT
+    # network-namespaced -- so DNS leaks via the host interface instead of going
+    # to $DNS_SERVER through the tunnel.
+    echo "hosts: files myhostname dns" > "/etc/netns/$NAMESPACE/nsswitch.conf"
+
     echo "Creating SOCKS5 proxy script..."
     cat > /tmp/simple-socks5.py << 'EOF'
 #!/usr/bin/env python3
