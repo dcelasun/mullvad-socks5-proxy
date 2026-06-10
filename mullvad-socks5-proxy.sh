@@ -41,6 +41,11 @@ parse_wg_config() {
     # Extract Endpoint
     ENDPOINT=$(grep "^Endpoint" "$config_file" | sed 's/^Endpoint[[:space:]]*=[[:space:]]*//')
 
+    # Host part of the endpoint (strip ":port" and IPv6 brackets)
+    ENDPOINT_IP="${ENDPOINT%:*}"
+    ENDPOINT_IP="${ENDPOINT_IP#[}"
+    ENDPOINT_IP="${ENDPOINT_IP%]}"
+
     # Extract AllowedIPs (but override for VPN proxy functionality)
     # Original: ALLOWED_IPS=$(grep "^AllowedIPs" "$config_file" | sed 's/^AllowedIPs[[:space:]]*=[[:space:]]*//')
     # For VPN proxy, we need to route all traffic through WireGuard
@@ -95,11 +100,52 @@ cleanup_existing() {
         rm -rf "/etc/netns/$NAMESPACE" 2>/dev/null
     fi
 
+    # Remove endpoint routing pin (may exist multiple times after unclean exits)
+    if [ -n "$ENDPOINT_IP" ]; then
+        while ip rule del to "$ENDPOINT_IP" lookup main priority 5000 2>/dev/null; do :; done
+    fi
+
     # Clean up temporary files
     rm -f /tmp/simple-socks5.py "/tmp/wg-$SERVER.conf"
 
     # Wait a moment for cleanup to complete
     sleep 1
+}
+
+# Function to check that the tunnel actually passes traffic
+tunnel_healthy() {
+    ip netns exec "$NAMESPACE" ping -c 1 -W 3 "$DNS_SERVER" > /dev/null 2>&1
+}
+
+# Function to recover a dead tunnel without tearing down the namespace.
+# Tier 1: re-apply the peer endpoint, which clears WireGuard's cached
+# source address/route (goes stale when host routing changes, e.g. after
+# suspend/resume or Tailscale state transitions).
+# Tier 2: bounce the interface.
+recover_tunnel() {
+    echo "Tunnel unhealthy, re-applying peer endpoint..."
+    ip netns exec "$NAMESPACE" wg set "$INTERFACE" peer "$PUBLIC_KEY" endpoint "$ENDPOINT"
+    sleep 5
+    if tunnel_healthy; then
+        echo "✓ Tunnel recovered after endpoint re-apply"
+        return 0
+    fi
+
+    echo "Still unhealthy, bouncing WireGuard interface..."
+    ip netns exec "$NAMESPACE" ip link set "$INTERFACE" down
+    ip netns exec "$NAMESPACE" ip link set "$INTERFACE" up
+    # IPv6 addresses and device routes are lost on link down
+    if [ -n "$IPV6_ADDR" ]; then
+        ip netns exec "$NAMESPACE" ip addr add "$IPV6_ADDR" dev "$INTERFACE" 2>/dev/null
+    fi
+    ip netns exec "$NAMESPACE" ip route add default dev "$INTERFACE" 2>/dev/null
+    sleep 5
+    if tunnel_healthy; then
+        echo "✓ Tunnel recovered after interface bounce"
+        return 0
+    fi
+
+    return 1
 }
 
 setup_namespace() {
@@ -181,6 +227,7 @@ PrivateKey = $PRIVATE_KEY
 PublicKey = $PUBLIC_KEY
 AllowedIPs = $ALLOWED_IPS
 Endpoint = $ENDPOINT
+PersistentKeepalive = 25
 EOF
 
     echo "Configuring WireGuard interface..."
@@ -202,6 +249,18 @@ EOF
     echo "Setting up routing..."
     ip netns exec "$NAMESPACE" ip route add default dev "$INTERFACE"
 
+    # The encrypted UDP traffic egresses from the host namespace (the
+    # WireGuard socket lives where the interface was created), so pin the
+    # endpoint to the main routing table. Otherwise policy-routing rules
+    # added by other software (e.g. Tailscale's "from all lookup 52")
+    # can divert or blackhole it.
+    case "$ENDPOINT_IP" in
+        *.*.*.*)
+            echo "Pinning route to endpoint $ENDPOINT_IP via main table..."
+            ip rule add to "$ENDPOINT_IP" lookup main priority 5000 2>/dev/null
+            ;;
+    esac
+
     # Set up DNS in the namespace
     echo "Setting up DNS..."
     mkdir -p "/etc/netns/$NAMESPACE"
@@ -221,83 +280,121 @@ import socket
 import threading
 import struct
 import sys
+import time
+
+HANDSHAKE_TIMEOUT = 30
+RELAY_BUFFER = 65536
+
+def recv_exact(sock, n):
+    buf = b''
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError('unexpected EOF')
+        buf += chunk
+    return buf
+
+def enable_keepalive(sock):
+    # Reap connections whose peer vanished without a FIN (e.g. after the
+    # machine sleeps), otherwise relay threads and their sockets leak
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 600)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 60)
+    sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 5)
+
+def relay(src, dst):
+    try:
+        while True:
+            data = src.recv(RELAY_BUFFER)
+            if not data:
+                break
+            dst.sendall(data)
+    except Exception:
+        pass
+    finally:
+        for s in (src, dst):
+            try:
+                s.close()
+            except Exception:
+                pass
 
 def handle_client(client_socket):
+    remote_socket = None
     try:
+        client_socket.settimeout(HANDSHAKE_TIMEOUT)
+
         # SOCKS5 authentication
-        data = client_socket.recv(262)
-        if len(data) < 3 or data[0] != 0x05:
-            client_socket.close()
+        ver, nmethods = recv_exact(client_socket, 2)
+        if ver != 0x05:
             return
+        recv_exact(client_socket, nmethods)
 
         # No authentication required
-        client_socket.send(b'\x05\x00')
+        client_socket.sendall(b'\x05\x00')
 
         # SOCKS5 request
-        data = client_socket.recv(4)
-        if len(data) < 4 or data[0] != 0x05 or data[1] != 0x01:
-            client_socket.close()
+        ver, cmd, _, atyp = recv_exact(client_socket, 4)
+        if ver != 0x05 or cmd != 0x01:
+            client_socket.sendall(b'\x05\x07\x00\x01\x00\x00\x00\x00\x00\x00')
             return
 
         # Parse address
-        if data[3] == 0x01:  # IPv4
-            addr_data = client_socket.recv(6)
-            addr = socket.inet_ntoa(addr_data[:4])
-            port = struct.unpack('>H', addr_data[4:6])[0]
-        elif data[3] == 0x03:  # Domain name
-            domain_len = client_socket.recv(1)[0]
-            domain_data = client_socket.recv(domain_len + 2)
-            addr = domain_data[:-2].decode('utf-8')
-            port = struct.unpack('>H', domain_data[-2:])[0]
+        if atyp == 0x01:  # IPv4
+            addr = socket.inet_ntoa(recv_exact(client_socket, 4))
+        elif atyp == 0x03:  # Domain name
+            domain_len = recv_exact(client_socket, 1)[0]
+            addr = recv_exact(client_socket, domain_len).decode('utf-8')
         else:
-            client_socket.send(b'\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00')
-            client_socket.close()
+            client_socket.sendall(b'\x05\x08\x00\x01\x00\x00\x00\x00\x00\x00')
             return
+        port = struct.unpack('>H', recv_exact(client_socket, 2))[0]
 
         # Connect to target
         try:
-            remote_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            remote_socket.connect((addr, port))
+            remote_socket = socket.create_connection((addr, port), timeout=HANDSHAKE_TIMEOUT)
+        except Exception:
+            client_socket.sendall(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
+            return
 
-            # Send success response
-            client_socket.send(b'\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00')
+        # Send success response
+        client_socket.sendall(b'\x05\x00\x00\x01\x00\x00\x00\x00\x00\x00')
 
-            # Relay data
-            def relay(src, dst):
+        client_socket.settimeout(None)
+        remote_socket.settimeout(None)
+        enable_keepalive(client_socket)
+        enable_keepalive(remote_socket)
+
+        # Relay data (this thread handles client->remote)
+        threading.Thread(target=relay, args=(remote_socket, client_socket), daemon=True).start()
+        relay(client_socket, remote_socket)
+
+    except Exception:
+        pass
+    finally:
+        for s in (client_socket, remote_socket):
+            if s is not None:
                 try:
-                    while True:
-                        data = src.recv(4096)
-                        if not data:
-                            break
-                        dst.send(data)
-                except:
+                    s.close()
+                except Exception:
                     pass
-                finally:
-                    src.close()
-                    dst.close()
-
-            threading.Thread(target=relay, args=(client_socket, remote_socket), daemon=True).start()
-            threading.Thread(target=relay, args=(remote_socket, client_socket), daemon=True).start()
-
-        except Exception as e:
-            client_socket.send(b'\x05\x01\x00\x01\x00\x00\x00\x00\x00\x00')
-            client_socket.close()
-
-    except Exception as e:
-        client_socket.close()
 
 def main():
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 1080
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind(('0.0.0.0', port))
-    server.listen(5)
+    server.listen(128)
 
     print(f"SOCKS5 proxy listening on port {port}")
 
     try:
         while True:
-            client, addr = server.accept()
+            try:
+                client, addr = server.accept()
+            except OSError:
+                # Transient failure (e.g. out of file descriptors); don't die
+                time.sleep(1)
+                continue
             threading.Thread(target=handle_client, args=(client,), daemon=True).start()
     except KeyboardInterrupt:
         print("Shutting down...")
@@ -316,7 +413,7 @@ EOF
     echo $SOCKS5_PID > "/tmp/mullvad-socks5-$SERVER.pid"
 
     # Save main script PID for stop command
-    echo $ > "/tmp/mullvad-main-$SERVER.pid"
+    echo $$ > "/tmp/mullvad-main-$SERVER.pid"
 
     echo "Waiting for proxy to start..."
     sleep 2
@@ -401,16 +498,46 @@ EOF
     echo "Test with: curl --socks5-hostname 127.0.0.1:$EXTERNAL_SOCKS5_PORT https://am.i.mullvad.net"
 
     # Keep the script running to maintain namespace reference
-    echo "Maintaining namespace... (PID: $)"
+    echo "Maintaining namespace... (PID: $$)"
     trap 'echo "Received termination signal, cleaning up..."; cleanup_existing; exit 0' TERM INT
 
-    # Wait for background processes and keep namespace alive
+    # Wait for background processes, keep namespace alive and verify the
+    # tunnel still passes traffic: it can die silently while every process
+    # stays up (observed after suspend/resume and Tailscale transitions)
+    TICKS=0
+    HEALTH_FAILS=0
     while kill -0 $SOCKS5_PID 2>/dev/null && kill -0 $SOCAT_PID 2>/dev/null; do
         sleep 5
+        TICKS=$((TICKS + 1))
+        if [ $((TICKS % 6)) -ne 0 ]; then
+            continue
+        fi
+
+        if tunnel_healthy; then
+            HEALTH_FAILS=0
+            continue
+        fi
+
+        HEALTH_FAILS=$((HEALTH_FAILS + 1))
+        echo "⚠ Tunnel health check failed ($HEALTH_FAILS)"
+        # Require two consecutive failures so a single lost ping
+        # doesn't trigger recovery
+        if [ "$HEALTH_FAILS" -lt 2 ]; then
+            continue
+        fi
+
+        if recover_tunnel; then
+            HEALTH_FAILS=0
+        else
+            echo "Error: Tunnel recovery failed, exiting so systemd restarts the service"
+            cleanup_existing
+            exit 1
+        fi
     done
 
     echo "Background processes terminated, cleaning up..."
     cleanup_existing
+    exit 1
 }
 
 cleanup_namespace() {
